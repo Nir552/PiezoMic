@@ -1,0 +1,16 @@
+# LTSpice simulation outputs
+*.raw
+*.op.raw
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
