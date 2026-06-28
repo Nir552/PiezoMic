@@ -6,7 +6,7 @@ A DIY piezoelectric microphone built from scratch — from analog circuit design
 
 ## What is this?
 
-A contact microphone built from a salvaged piezo disc, a plastic cup, and a nitrile glove membrane — connected to an ESP32 through a custom two-stage BJT amplifier circuit. The system captures speech at 16kHz and streams it to a PC over USB serial, where a Python-based DSP pipeline cleans up the audio from 3.4 dB SNR to 30.9 dB SNR.
+A contact microphone built from a salvaged piezo disc, a plastic cup, and a nitrile glove membrane — connected to an ESP32 through a custom two-stage BJT amplifier circuit. The system captures speech at 16kHz and streams it to a PC over USB serial, where a Python-based DSP pipeline cleans up the audio through a multi-stage filter chain (mains-hum removal, background-noise reduction, and band-limiting to the speech range).
 
 ## System Architecture
 
@@ -27,9 +27,7 @@ Piezo Disc → BJT Amplifier (2-stage) → ESP32 ADC (I2S DMA) → USB Serial �
 
 ## Results
 
-| Metric | Raw | Filtered |
-|--------|-----|----------|
-| SNR | 3.4 dB | 30.9 dB |
+The recorded speech is clearly intelligible. The DSP chain noticeably reduces background hiss and mains hum — the effect is audible in the before/after samples below, and visible in the spectrum and spectrogram, where high-frequency noise and the 50Hz line components are attenuated while the speech band (roughly 100Hz–4kHz) is preserved.
 
 ![Audio Enhancement - Full Chain](docs/full_chain.png)
 
@@ -48,6 +46,8 @@ Two-stage BJT amplifier using 2N2222 transistors:
 - **Stage 1 — Emitter Follower:** High input impedance (~1MΩ) to avoid loading the piezo crystal. Unity voltage gain, low output impedance.
 - **Stage 2 — Common Emitter:** Voltage amplification with biasing via voltage divider (R5=28.85K, R7=1.524K). AC-coupled from buffer stage through 10µF capacitor.
 - **Output:** RC low-pass filter (R9=1K, C5=10nF) before ADC input, with DC bias at ~1.65V for mid-range ADC operation.
+
+> Note: this is a breadboard prototype using 2N2222 transistors. On breadboard the front-end picks up significant environmental noise and the achievable gain is limited; the digital filter chain compensates for much of this. A cleaner op-amp-based front-end on a PCB is a natural next step.
 
 ### Simulation Results
 
@@ -103,7 +103,7 @@ PiezoMic/
     ├── time_domain_simulation.jpeg
     ├── noise_analysis.png       # Noise spectrum analysis
     ├── audio_analysis.png       # Waveform, spectrogram, PSD
-    └── full_chain.png           # SNR progression across filter stages
+    └── full_chain.png           # Before/after PSD, waveform and spectrogram
 ```
 
 ## Requirements
