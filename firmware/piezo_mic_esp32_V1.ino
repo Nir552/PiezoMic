@@ -1,158 +1,159 @@
-# PiezoMic
+// ============================================================
+// Piezo Microphone - ESP32 Firmware
+// ============================================================
+// דוגם אות מפיזו דרך ADC1 (GPIO34) באמצעות I2S DMA
+// עושה oversampling ב-64kHz ו-decimation ל-16kHz
+// שולח את הנתונים דרך USB Serial למחשב
+// ============================================================
 
-A DIY piezoelectric microphone built from scratch — from analog circuit design to digital signal processing.
+#include <driver/i2s.h>
+#include <driver/adc.h>
+#include <WiFi.h>
+#include <esp_bt.h>
+#include <soc/syscon_reg.h>
 
-![Microphone Build](docs/microphone_build.jpeg)
+// --- הגדרות דגימה ---
+// אנחנו דוגמים ב-64kHz אבל I2S דוגם שני ערוצים,
+// אז צריך להגדיר 128kHz כדי לקבל 64kHz אפקטיבי
+#define I2S_SAMPLE_RATE     128000  // 128kHz → 64kHz אפקטיבי (כפול בגלל stereo)
+#define OVERSAMPLE_RATIO    4       // 64kHz / 4 = 16kHz אפקטיבי אחרי decimation
+#define EFFECTIVE_RATE      16000   // קצב הדגימה הסופי שנשלח למחשב
 
-## What is this?
+// --- הגדרות I2S DMA ---
+#define I2S_DMA_BUF_COUNT   4       // מספר באפרים ב-DMA
+#define I2S_DMA_BUF_LEN     1024    // דגימות לכל באפר
 
-A contact microphone built from a salvaged piezo disc, a plastic cup, and a nitrile glove membrane — connected to an ESP32 through a custom two-stage BJT amplifier circuit. The system captures speech at 16kHz and streams it to a PC over USB serial, where a Python-based DSP pipeline cleans up the audio through a multi-stage filter chain (mains-hum removal, background-noise reduction, and band-limiting to the speech range).
+// --- הגדרות Serial ---
+#define SERIAL_BAUD         921600  // מהירות גבוהה לשליחת אודיו
 
-## System Architecture
+// --- פין ADC ---
+// GPIO34 = ADC1_CHANNEL_6
+#define ADC_PIN             ADC1_CHANNEL_6
 
-```
-Piezo Disc → BJT Amplifier (2-stage) → ESP32 ADC (I2S DMA) → USB Serial → Python Recorder → DSP Filter Chain → WAV
-```
+// --- באפר קריאה ---
+// I2S מחזיר 16-bit לכל דגימה, נקרא בלוקים
+#define READ_BUF_SIZE       1024
+uint16_t i2s_read_buf[READ_BUF_SIZE];
 
-**Analog stage:** Emitter follower (high-impedance buffer) → AC-coupled common-emitter amplifier, both using 2N2222 transistors. Powered from 3.3V with voltage divider biasing. The circuit was designed and simulated in LTSpice before breadboard assembly.
+// --- משתני decimation ---
+int32_t decimation_accumulator = 0;  // צובר דגימות ל-averaging
+uint8_t decimation_count = 0;        // סופר כמה דגימות נצברו
 
-**Digital stage:** The ESP32 samples at 64kHz using I2S-driven ADC with DMA, applies 4x decimation (averaging) to produce a 16kHz output stream, and sends data blocks over serial at 921600 baud with a sync protocol (0xAA 0x55 header + block size).
+// --- באפר שליחה ---
+// באפר של דגימות אחרי decimation, מוכנות לשליחה
+#define SEND_BUF_SIZE       512
+uint16_t send_buf[SEND_BUF_SIZE];
+uint16_t send_buf_index = 0;
 
-**DSP pipeline (Python):**
-1. High-pass filter (100Hz, 4th order Butterworth) — removes mechanical vibration
-2. Notch filters (50Hz + harmonics) — removes Israeli power line interference
-3. Spectral subtraction — estimates and removes stationary background noise
-4. Presence boost (2kHz, gentle peak) — improves speech intelligibility
-5. Low-pass filter (4kHz) — removes out-of-band noise
+// --- סנכרון ---
+// header byte ששולחים לפני כל בלוק נתונים
+// כדי שה-Python יוכל לזהות תחילת בלוק
+#define SYNC_BYTE_1         0xAA
+#define SYNC_BYTE_2         0x55
 
-## Results
+void setup() {
+  // --- אתחול Serial ---
+  Serial.begin(SERIAL_BAUD);
+  while (!Serial) { delay(10); }
+  
+  // --- כיבוי WiFi ו-BT להפחתת רעש ---
+  // WiFi ו-BT יוצרים רעש חשמלי שמפריע ל-ADC
+  WiFi.mode(WIFI_OFF);
+  esp_bt_controller_disable();
+  
+  // --- הגדרת ADC ---
+  // 6dB attenuation: טווח מדידה מומלץ 150-1750mV
+  // האות שלנו יושב על ~1.5V ± 200mV → בול בטווח
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC_PIN, ADC_ATTEN_DB_6);
+  
+  // --- הגדרת I2S למוד ADC ---
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
+    .sample_rate = I2S_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = I2S_DMA_BUF_COUNT,
+    .dma_buf_len = I2S_DMA_BUF_LEN,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+  
+  // התקנת דרייבר I2S
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  
+  // חיבור I2S ל-ADC
+  i2s_set_adc_mode(ADC_UNIT_1, ADC_PIN);
+  
+  // תיקון: ה-ADC של ESP32 מחזיר ערכים הפוכים כברירת מחדל
+  // צריך להפוך אותם חזרה
+  SET_PERI_REG_MASK(SYSCON_SARADC_CTRL2_REG, SYSCON_SARADC_SAR1_INV);
+  
+  // המתנה ליציבות ה-ADC
+  delay(1000);
+  
+  // הפעלת ה-ADC דרך I2S
+  i2s_adc_enable(I2S_NUM_0);
+  
+  // המתנה נוספת - נחוצה ליציבות
+  delay(500);
+  
+  // ניקוי באפרים ראשוניים (מכילים זבל)
+  size_t bytes_read;
+  for (int i = 0; i < I2S_DMA_BUF_COUNT; i++) {
+    i2s_read(I2S_NUM_0, i2s_read_buf, READ_BUF_SIZE * sizeof(uint16_t), &bytes_read, portMAX_DELAY);
+  }
+}
 
-The recorded speech is clearly intelligible. The DSP chain noticeably reduces background hiss and mains hum — the effect is audible in the before/after samples below, and visible in the spectrum and spectrogram, where high-frequency noise and the 50Hz line components are attenuated while the speech band (roughly 100Hz–4kHz) is preserved.
-
-![Audio Enhancement - Full Chain](docs/full_chain.png)
-
-### Audio Samples
-
-- [`samples/raw_recording.wav`](samples/raw_recording.wav) — raw capture from ESP32, no processing
-- [`samples/filtered_recording.wav`](samples/filtered_recording.wav) — after full DSP chain
-
-## Hardware
-
-### Circuit Schematic
-
-![Schematic](docs/schematic.jpeg)
-
-Two-stage BJT amplifier using 2N2222 transistors:
-- **Stage 1 — Emitter Follower:** High input impedance (~1MΩ) to avoid loading the piezo crystal. Unity voltage gain, low output impedance.
-- **Stage 2 — Common Emitter:** Voltage amplification with biasing via voltage divider (R5=28.85K, R7=1.524K). AC-coupled from buffer stage through 10µF capacitor.
-- **Output:** RC low-pass filter (R9=1K, C5=10nF) before ADC input, with DC bias at ~1.65V for mid-range ADC operation.
-
-> Note: this is a breadboard prototype using 2N2222 transistors. On breadboard the front-end picks up significant environmental noise and the achievable gain is limited; the digital filter chain compensates for much of this. A cleaner op-amp-based front-end on a PCB is a natural next step.
-
-### Simulation Results
-
-| | |
-|---|---|
-| ![Frequency Response](docs/frequency_response.jpeg) | ![Time Domain](docs/time_domain_simulation.jpeg) |
-| Bode plot — gain and phase response | Transient simulation — signal at each node |
-
-### Bill of Materials
-
-| Component | Value | Role |
-|-----------|-------|------|
-| Piezo disc | Salvaged | Transducer |
-| 2N2222 (×2) | NPN BJT | Buffer + Amplifier |
-| R1 | 220Ω | Power supply decoupling |
-| R2 | 10KΩ | Emitter follower load |
-| R3 | 1MΩ | Buffer base bias |
-| R4 | 1MΩ | Buffer base bias |
-| R5 | 28.85KΩ | Amplifier bias divider (top) |
-| R6 | 10KΩ | Amplifier bias divider (bottom) |
-| R7 | 1.524KΩ | Collector resistor |
-| R8 | 100Ω | Emitter degeneration |
-| R9 | 1KΩ | Output filter |
-| C1 | 10µF | Power supply filter |
-| C2 | 10nF | Power supply HF bypass |
-| C3 | 10nF | Input AC coupling |
-| C4 | 10µF | Inter-stage AC coupling |
-| C5 | 10nF | Output low-pass filter |
-
-### Physical Build
-
-The microphone housing is a plastic cup with a nitrile glove stretched over the opening as a membrane (held tight with rubber bands). The piezo disc sits underneath the membrane, and the leads are shielded with aluminum foil to reduce electromagnetic interference.
-
-## Project Structure
-
-```
-PiezoMic/
-├── README.md
-├── firmware/
-│   ├── piezo_mic_esp32_V1.ino   # ESP32 firmware (I2S ADC + serial streaming)
-│   └── esp32_recorder.py        # Python receiver with live waveform + FFT display
-├── scripts/
-│   └── audio_filters.py         # DSP filter chain (HP → Notch → Spectral Sub → Boost → LP)
-├── samples/
-│   ├── raw_recording.wav        # Raw capture from ESP32
-│   └── filtered_recording.wav   # After full DSP pipeline
-├── hardware/
-│   └── amplifier_circuit.asc    # LTSpice schematic (open with LTSpice)
-└── docs/
-    ├── microphone_build.jpeg    # Photo of the physical microphone
-    ├── schematic.jpeg           # Circuit schematic
-    ├── frequency_response.jpeg  # Bode plot from simulation
-    ├── time_domain_simulation.jpeg
-    ├── noise_analysis.png       # Noise spectrum analysis
-    ├── audio_analysis.png       # Waveform, spectrogram, PSD
-    └── full_chain.png           # Before/after PSD, waveform and spectrogram
-```
-
-## Requirements
-
-### Hardware
-- ESP32 development board
-- Piezo disc (any salvaged buzzer element works)
-- 2× 2N2222 NPN transistors
-- Resistors and capacitors (see BOM above)
-- Breadboard + jumper wires
-- USB cable
-
-### Software
-- [Arduino IDE](https://www.arduino.cc/en/software) or PlatformIO (for ESP32 firmware)
-- Python 3.8+
-- [LTSpice](https://www.analog.com/en/resources/design-tools-and-calculators/ltspice-simulator.html) (optional, for circuit simulation)
-
-```bash
-pip install pyserial numpy matplotlib scipy
-```
-
-## Usage
-
-1. Flash `firmware/piezo_mic_esp32_V1.ino` to your ESP32
-2. Run the recorder:
-   ```bash
-   python firmware/esp32_recorder.py
-   ```
-3. Speak into the microphone — you'll see live waveform and FFT
-4. Close the plot window to stop and save the WAV file
-5. Apply the filter chain:
-   ```bash
-   python scripts/audio_filters.py samples/raw_recording.wav samples/filtered_recording.wav
-   ```
-
-## Analysis
-
-### Noise Characterization
-
-![Noise Analysis](docs/noise_analysis.png)
-
-### Raw Audio Analysis
-
-![Audio Analysis](docs/audio_analysis.png)
-
-## License
-
-MIT
-
-## Author
-
-Nir Sabbah
+void loop() {
+  size_t bytes_read = 0;
+  
+  // --- קריאת בלוק מ-I2S DMA ---
+  // הפונקציה חוסמת עד שיש נתונים זמינים
+  i2s_read(I2S_NUM_0, i2s_read_buf, READ_BUF_SIZE * sizeof(uint16_t), &bytes_read, portMAX_DELAY);
+  
+  int samples_read = bytes_read / sizeof(uint16_t);
+  
+  // --- עיבוד כל דגימה ---
+  for (int i = 0; i < samples_read; i++) {
+    // חילוץ 12 הביטים התחתונים (ה-ADC הוא 12-bit)
+    // I2S מחזיר 16-bit, 4 ביטים עליונים הם ערוץ
+    uint16_t raw_sample = i2s_read_buf[i] & 0x0FFF;
+    
+    // --- Decimation: צובר 4 דגימות ומחשב ממוצע ---
+    decimation_accumulator += raw_sample;
+    decimation_count++;
+    
+    if (decimation_count >= OVERSAMPLE_RATIO) {
+      // ממוצע → דגימה אחת ב-16kHz
+      uint16_t decimated_sample = decimation_accumulator / OVERSAMPLE_RATIO;
+      
+      // שמירה בבאפר השליחה
+      send_buf[send_buf_index++] = decimated_sample;
+      
+      // איפוס ה-accumulator
+      decimation_accumulator = 0;
+      decimation_count = 0;
+      
+      // --- שליחה כשהבאפר מלא ---
+      if (send_buf_index >= SEND_BUF_SIZE) {
+        // שליחת sync header
+        Serial.write(SYNC_BYTE_1);
+        Serial.write(SYNC_BYTE_2);
+        
+        // שליחת גודל הבלוק (2 bytes, little-endian)
+        uint16_t block_size = SEND_BUF_SIZE;
+        Serial.write((uint8_t)(block_size & 0xFF));
+        Serial.write((uint8_t)(block_size >> 8));
+        
+        // שליחת הנתונים כ-bytes (2 bytes לכל דגימה, little-endian)
+        Serial.write((uint8_t*)send_buf, SEND_BUF_SIZE * sizeof(uint16_t));
+        
+        send_buf_index = 0;
+      }
+    }
+  }
+}
